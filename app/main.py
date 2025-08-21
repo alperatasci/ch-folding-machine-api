@@ -1,153 +1,36 @@
-import io
 import os
-import re
-import json
-import time
-import math
+import io
 import logging
-import pathlib
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from typing import Optional, Tuple, Dict, Any, List
 
 import requests
-from PIL import Image, ImageOps
+from fastapi import FastAPI, Query, Body, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
+from pydantic import BaseModel
+from PIL import Image, ImageDraw, ImageFont
 
 import psycopg2
-import psycopg2.extras
 from psycopg2.pool import SimpleConnectionPool
 
-from fastapi import FastAPI, Query, Body, Response
-from fastapi.responses import JSONResponse
+# ----------------------
+# Config
+# ----------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PGSSL = os.getenv("PGSSL", "require").strip()
+FALLBACK_PDF_BASE = os.getenv("FALLBACK_PDF_BASE", "").strip()  # e.g. https://<app>/label
+INCLUDE_PNG_URL = os.getenv("INCLUDE_PNG_URL", "0").strip() == "1"
+PNG_TO_PDF_MODE = os.getenv("PNG_TO_PDF_MODE", "auto").strip()  # auto|force|off
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
 
-# -----------------------------------------------------------------------------
-# App / config
-# -----------------------------------------------------------------------------
-app = FastAPI()
-log = logging.getLogger("uvicorn.error")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ch-folding-api")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-FORCE_PG_SSL = os.getenv("PGSSL", "").strip() not in ("", "0", "false", "False", "no", "NO")
-FALLBACK_PDF_BASE = os.getenv("FALLBACK_PDF_BASE", "").rstrip("/")
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "12"))
-PNG_TO_PDF_DPI = int(os.getenv("PNG_TO_PDF_DPI", "300"))
-CACHE_DIR = "/tmp/label-cache"
-pathlib.Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+app = FastAPI(title="CH Folding Machine API", version="1.0.0")
 
-DB_POOL: Optional[SimpleConnectionPool] = None
+# Connection pool (optional; only if DATABASE_URL is set)
+POOL: Optional[SimpleConnectionPool] = None
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
-def _dsn_with_ssl(db_url: str) -> str:
-    """
-    Ensure sslmode=require if requested or missing. Works with postgres:// and postgresql:// URLs.
-    """
-    try:
-        u = urlparse(db_url)
-        if u.scheme.startswith("postgres"):
-            qs = dict(parse_qsl(u.query, keep_blank_values=True))
-            if FORCE_PG_SSL and qs.get("sslmode") != "require":
-                qs["sslmode"] = "require"
-                u = u._replace(query=urlencode(qs))
-                return urlunparse(u)
-    except Exception:
-        pass
-    return db_url
-
-def _open_db_conn():
-    global DB_POOL
-    if not DATABASE_URL:
-        return None
-    if DB_POOL is None:
-        dsn = _dsn_with_ssl(DATABASE_URL)
-        # Dict cursor for column access by name
-        DB_POOL = SimpleConnectionPool(
-            minconn=1,
-            maxconn=8,
-            dsn=dsn,
-            cursor_factory=psycopg2.extras.DictCursor,
-        )
-        log.info("DB pool initialized.")
-    return DB_POOL
-
-def _get_conn():
-    pool = _open_db_conn()
-    if not pool:
-        return None
-    return pool.getconn()
-
-def _put_conn(conn):
-    if DB_POOL and conn:
-        DB_POOL.putconn(conn)
-
-def _infer_is_pdf(url: str) -> bool:
-    u = url.lower()
-    if ".pdf" in u:
-        return True
-    return False
-
-def _vars_to_lookup(vars_arr: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for it in vars_arr or []:
-        name = str(it.get("name", "")).strip()
-        val = it.get("value", "")
-        if not name:
-            continue
-        out[name.lower()] = val
-    return out
-
-def _compose_label_pdf_from_image(img_bytes: bytes) -> bytes:
-    """
-    Convert PNG/JPG bytes to a single-page PDF sized to 4x6 inches at PNG_TO_PDF_DPI.
-    """
-    with Image.open(io.BytesIO(img_bytes)) as im:
-        # Ensure RGB (remove alpha on white background)
-        if im.mode in ("RGBA", "LA"):
-            bg = Image.new("RGB", im.size, (255, 255, 255))
-            bg.paste(im, mask=im.split()[-1])
-            im = bg
-        elif im.mode != "RGB":
-            im = im.convert("RGB")
-
-        # Target canvas 4x6 in at DPI
-        target_w = int(4 * PNG_TO_PDF_DPI)
-        target_h = int(6 * PNG_TO_PDF_DPI)
-
-        # Letterbox/pad to fit while preserving aspect ratio
-        im = ImageOps.contain(im, (target_w, target_h))
-        canvas = Image.new("RGB", (target_w, target_h), "white")
-        x = (target_w - im.width) // 2
-        y = (target_h - im.height) // 2
-        canvas.paste(im, (x, y))
-
-        out = io.BytesIO()
-        canvas.save(out, format="PDF", resolution=float(PNG_TO_PDF_DPI))
-        return out.getvalue()
-
-def _cache_path(barcode: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", barcode)
-    return os.path.join(CACHE_DIR, f"{safe}.pdf")
-
-def _read_cache(path: str) -> Optional[bytes]:
-    try:
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                return f.read()
-    except Exception as e:
-        log.warning(f"cache read failed: {e}")
-    return None
-
-def _write_cache(path: str, data: bytes) -> None:
-    try:
-        with open(path, "wb") as f:
-            f.write(data)
-    except Exception as e:
-        log.warning(f"cache write failed: {e}")
-
-# -----------------------------------------------------------------------------
-# DB query
-# -----------------------------------------------------------------------------
-SQL_LABEL = """
+ORDER_QUERY = """
 with item_vars as (
   select oi."OrderId",
          json_agg(json_build_object('name', oiv."FormattedName", 'value', oiv."FormattedValue")) as vars,
@@ -168,197 +51,242 @@ order by os."CreatedAt" desc nulls last
 limit 1;
 """
 
-def db_fetch_order(barcode: str) -> Optional[Dict[str, Any]]:
-    conn = _get_conn()
-    if conn is None:
-        log.error("DATABASE_URL not configured; cannot fetch from DB.")
-        return None
-    try:
-        with conn.cursor() as cur:
-            cur.execute(SQL_LABEL, (barcode,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {
-                "barcode": row["barcode"],
-                "label_url": row["label_url"] or "",
-                "quantity": int(row["quantity"] or 1),
-                "vars": row["vars"] or [],
-            }
-    finally:
-        _put_conn(conn)
+# ----------------------
+# Models
+# ----------------------
+class ScanBody(BaseModel):
+    barcode: str
+    mac: Optional[str] = None
 
-# -----------------------------------------------------------------------------
-# API routes
-# -----------------------------------------------------------------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-def _make_payload(
-    barcode: str, prefer: Optional[str] = None
-) -> Tuple[int, Dict[str, Any]]:
-    """
-    Returns (http_status, payload_dict)
-    payload follows factory schema.
-    """
-    if not barcode:
-        return 400, {"code": 0, "msg": "barcode required"}
-
-    rec = db_fetch_order(barcode)
-    if not rec:
-        return 200, {"code": 0, "msg": "Not found"}
-
-    label_url = rec.get("label_url") or ""
-    qty = int(rec.get("quantity") or 1)
-    vars_arr = rec.get("vars") or []
-    var_map = _vars_to_lookup(vars_arr)
-
-    color = var_map.get("color", "") or var_map.get("colour", "")
-    size = var_map.get("size", "")
-    order_code = var_map.get("order", "")
-
-    # Decide final PDF URL
-    if label_url and _infer_is_pdf(label_url):
-        pdf_url = label_url
-        png_url = ""
-    elif label_url:
-        # Image => expose local PDF proxy for machines
-        if FALLBACK_PDF_BASE:
-            pdf_url = f"{FALLBACK_PDF_BASE}/{barcode}.pdf"
-        else:
-            # No base configured; fall back to image (not recommended by factory)
-            pdf_url = f"/label/{barcode}.pdf"
-        png_url = label_url
-    else:
-        # No url in DB at all
-        return 200, {"code": 0, "msg": "Not found"}
-
-    payload: Dict[str, Any] = {
-        "code": 1,
-        "msg": "OK",
-        "Quantity": qty,
-        "Order": order_code,
-        "Color": color,
-        "Size": size,
-        "Barcode": barcode,
-        "PDFUrl": pdf_url,
-    }
-
-    # For your own testing: include PNGUrl when available or explicitly requested
-    if png_url and (prefer == "png" or os.getenv("INCLUDE_PNG_URL", "0") == "1"):
-        payload["PNGUrl"] = png_url
-
-    return 200, payload
-
-def _extract_barcode_and_prefer(
-    barcode: Optional[str], mac: Optional[str], prefer: Optional[str]
-) -> Tuple[Optional[str], Optional[str]]:
-    # Factory only cares about barcode. We accept mac but ignore it.
-    bc = (barcode or "").strip()
-    pf = (prefer or "").strip().lower()
-    if pf not in ("", "png", "pdf"):
-        pf = ""
-    return bc, pf
-
-@app.get("/api/scanbarcode/getpdfurl")
-def scanbarcode_getpdfurl(
-    barcode: Optional[str] = Query(default=None),
-    mac: Optional[str] = Query(default=None),
-    prefer: Optional[str] = Query(default=None, description="png|pdf (debug)"),
-):
-    bc, pf = _extract_barcode_and_prefer(barcode, mac, prefer)
-    status, payload = _make_payload(bc, pf)
-    return JSONResponse(status_code=status, content=payload)
-
-@app.post("/api/scanbarcode/getpdfurl")
-def scanbarcode_getpdfurl_post(body: Dict[str, Any] = Body(default={})):
-    bc = str(body.get("barcode", "") or "").strip()
-    prefer = str(body.get("prefer", "") or "").strip().lower()
-    status, payload = _make_payload(bc, prefer)
-    return JSONResponse(status_code=status, content=payload)
-
-# Backward-compat alias that behaves the same
-@app.get("/api/printdata")
-@app.post("/api/printdata")
-def printdata_alias(
-    barcode: Optional[str] = Query(default=None),
-    mac: Optional[str] = Query(default=None),
-    prefer: Optional[str] = Query(default=None),
-    body: Optional[Dict[str, Any]] = Body(default=None),
-):
-    if body and not barcode:
-        barcode = str(body.get("barcode", "") or "")
-        prefer = str((body.get("prefer") or "")).lower()
-    bc, pf = _extract_barcode_and_prefer(barcode, mac, prefer)
-    status, payload = _make_payload(bc, pf)
-    return JSONResponse(status_code=status, content=payload)
-
-# -----------------------------------------------------------------------------
-# PDF proxy/converter
-# -----------------------------------------------------------------------------
-@app.get("/label/{barcode}.pdf")
-def label_pdf(barcode: str):
-    """
-    For a given barcode:
-    - If DB URL is already a PDF, proxy it back (no redirect).
-    - If DB URL is image, convert to 4x6in PDF and cache.
-    """
-    if not barcode:
-        return Response(status_code=404, content=b"Not Found", media_type="text/plain")
-
-    cache_file = _cache_path(barcode)
-    cached = _read_cache(cache_file)
-    if cached:
-        return Response(content=cached, media_type="application/pdf")
-
-    rec = db_fetch_order(barcode)
-    if not rec:
-        return Response(status_code=404, content=b"Not Found", media_type="text/plain")
-
-    label_url = rec.get("label_url") or ""
-    if not label_url:
-        return Response(status_code=404, content=b"Not Found", media_type="text/plain")
-
-    try:
-        r = requests.get(label_url, timeout=REQUEST_TIMEOUT, stream=True)
-        r.raise_for_status()
-        content_type = (r.headers.get("content-type") or "").lower()
-
-        # If it's a PDF already, stream it back
-        if _infer_is_pdf(label_url) or "application/pdf" in content_type:
-            blob = r.content if hasattr(r, "content") else r.raw.read()
-            _write_cache(cache_file, blob)
-            return Response(content=blob, media_type="application/pdf")
-
-        # Otherwise treat as an image and convert
-        blob = r.content if hasattr(r, "content") else r.raw.read()
-        pdf_bytes = _compose_label_pdf_from_image(blob)
-        _write_cache(cache_file, pdf_bytes)
-        return Response(content=pdf_bytes, media_type="application/pdf")
-    except Exception as e:
-        log.exception(f"label proxy/convert failed for {barcode}: {e}")
-        return Response(status_code=502, content=b"Upstream fetch/convert failed", media_type="text/plain")
-
-# -----------------------------------------------------------------------------
-# Startup / shutdown
-# -----------------------------------------------------------------------------
+# ----------------------
+# App lifecycle
+# ----------------------
 @app.on_event("startup")
 def on_startup():
-    try:
-        if DATABASE_URL:
-            _open_db_conn()
-    except Exception as e:
-        # Don't crash the pod if DB is temporarily unavailable; API will return Not found
-        log.error(f"DB pool init failed: {e}")
+    global POOL
+    if DATABASE_URL:
+        # add sslmode if missing
+        dsn = DATABASE_URL
+        if "sslmode=" not in dsn and PGSSL:
+            sep = "&" if "?" in dsn else "?"
+            dsn = f"{dsn}{sep}sslmode={PGSSL}"
+        POOL = SimpleConnectionPool(minconn=1, maxconn=5, dsn=dsn)
+        log.info("DB pool created.")
+    else:
+        log.warning("DATABASE_URL not set. API will run in FALLBACK mode only.")
 
 @app.on_event("shutdown")
 def on_shutdown():
-    global DB_POOL
+    global POOL
+    if POOL:
+        POOL.closeall()
+        log.info("DB pool closed.")
+
+# ----------------------
+# Helpers
+# ----------------------
+def db_get_order(barcode: str) -> Optional[Dict[str, Any]]:
+    """Fetch order info from DB; returns None if not found or DB not configured."""
+    if not POOL:
+        return None
+    conn = None
     try:
-        if DB_POOL:
-            DB_POOL.closeall()
-            DB_POOL = None
-            log.info("DB pool closed.")
+        conn = POOL.getconn()
+        with conn.cursor() as cur:
+            cur.execute(ORDER_QUERY, (barcode,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            # row: (barcode, label_url, quantity, vars_json)
+            return {
+                "barcode": row[0],
+                "label_url": row[1] or "",
+                "quantity": int(row[2] or 1),
+                "vars": row[3] or [],
+            }
+    finally:
+        if conn:
+            POOL.putconn(conn)
+
+def extract_var(vars_list: List[Dict[str, Any]], names: List[str]) -> str:
+    """Find first matching variable name (case-insensitive)."""
+    lname = [n.lower() for n in names]
+    for item in vars_list or []:
+        n = str(item.get("name", "")).lower()
+        if n in lname:
+            return str(item.get("value", "") or "")
+    return ""
+
+def build_urls(barcode: str, label_url: str) -> Tuple[str, Optional[str]]:
+    """
+    Decide the PDFUrl (required) and optional PNGUrl.
+    - If label_url is a PDF and PNG_TO_PDF_MODE!=force: use it directly at /label/{barcode}.pdf (proxied).
+    - If label_url is an image (png/jpg), we expose /label/{barcode}.pdf that will convert on demand.
+    - If no label_url, fall back to FALLBACK_PDF_BASE/{barcode}.pdf (served by /label/... making a simple PDF).
+    """
+    # Always point machine to *our* /label/{barcode}.pdf endpoint
+    base = FALLBACK_PDF_BASE.rstrip("/") if FALLBACK_PDF_BASE else ""
+    if not base:
+        # try to auto-derive from current app root (best effort for dev)
+        base = "/label"
+    pdf_url = f"{base}/{barcode}.pdf"
+
+    png_url = None
+    if INCLUDE_PNG_URL:
+        # If the source is actually a PNG/JPG, and it's public, we can also surface it
+        if label_url and label_url.lower().endswith((".png", ".jpg", ".jpeg")):
+            png_url = label_url
+        else:
+            # Provide a local alias for consistency even if src is PDF
+            # (Factory said PNG not needed; this is optional.)
+            png_url = None
+    return pdf_url, png_url
+
+def http_get(url: str) -> bytes:
+    r = requests.get(url, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.content
+
+def image_to_pdf_bytes(img_bytes: bytes) -> bytes:
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        # Convert to RGB and save as single-page PDF
+        if im.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        else:
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, format="PDF")
+        return out.getvalue()
+
+def make_fallback_pdf(barcode: str) -> bytes:
+    # Very simple one-page PDF with the barcode text (for dev/testing only)
+    img = Image.new("RGB", (600, 900), "white")
+    draw = ImageDraw.Draw(img)
+    msg = f"NO LABEL FOUND\nBARCODE: {barcode}"
+    try:
+        # default PIL font
+        draw.multiline_text((40, 100), msg, fill="black", spacing=10)
+    except Exception:
+        draw.text((40, 100), msg, fill="black")
+    out = io.BytesIO()
+    img.save(out, format="PDF")
+    return out.getvalue()
+
+def resolve_label(barcode: str) -> Dict[str, Any]:
+    """
+    Returns a dict with fields needed for response + serving /label/{barcode}.pdf.
+    """
+    row = db_get_order(barcode)
+    label_url = (row or {}).get("label_url", "") if row else ""
+    quantity = (row or {}).get("quantity", 1)
+    vars_list = (row or {}).get("vars", [])
+
+    # Try to map vars to Size/Color (best effort; safe if empty)
+    size = extract_var(vars_list, ["Size", "SIZE", "size"])
+    color = extract_var(vars_list, ["Color", "COLOR", "color", "Colorway"])
+
+    pdf_url, png_url = build_urls(barcode, label_url)
+
+    return {
+        "barcode": barcode,
+        "label_url": label_url,
+        "quantity": int(quantity or 1),
+        "order": "",   # not present in your schema; leave empty
+        "color": color or "",
+        "size": size or "",
+        "pdf_url": pdf_url,
+        "png_url": png_url,
+    }
+
+# ----------------------
+# API Routes
+# ----------------------
+@app.get("/healthz")
+def healthz():
+    return PlainTextResponse("ok")
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "ch-folding-machine-api"}
+
+def _factory_payload(barcode: str) -> Dict[str, Any]:
+    data = resolve_label(barcode)
+    label_url = data["label_url"]
+    payload = {
+        "code": 1,
+        "msg": "OK",
+        "Quantity": data["quantity"],
+        "Order": data["order"],
+        "Color": data["color"],
+        "Size": data["size"],
+        "Barcode": barcode,
+        "PDFUrl": data["pdf_url"],
+    }
+    if INCLUDE_PNG_URL and data.get("png_url"):
+        payload["PNGUrl"] = data["png_url"]
+
+    # If nothing in DB and no FALLBACK_PDF_BASE set, treat as not found
+    if not label_url and not FALLBACK_PDF_BASE:
+        payload.update({"code": 0, "msg": "Not found"})
+    return payload
+
+# Preferred by factory (GET)
+@app.get("/api/scanbarcode/getpdfurl")
+def get_pdfurl(barcode: str = Query(..., description="order number / barcode"),
+               mac: Optional[str] = Query(None)):
+    return JSONResponse(_factory_payload(barcode))
+
+# Alias to the same behavior (GET)
+@app.get("/api/printdata")
+def get_pdfurl_alias(barcode: str = Query(...), mac: Optional[str] = Query(None)):
+    return JSONResponse(_factory_payload(barcode))
+
+# POST variants (just in case they use POST)
+@app.post("/api/scanbarcode/getpdfurl")
+def post_pdfurl(body: ScanBody = Body(...)):
+    return JSONResponse(_factory_payload(body.barcode))
+
+@app.post("/api/printdata")
+def post_pdfurl_alias(body: ScanBody = Body(...)):
+    return JSONResponse(_factory_payload(body.barcode))
+
+# Serve the actual PDF the machine will download
+@app.get("/label/{barcode}.pdf")
+def serve_pdf(barcode: str):
+    data = resolve_label(barcode)
+    src = data["label_url"]
+
+    # Decide how to produce PDF bytes
+    # - If src is PDF AND not forcing conversion → proxy it.
+    # - If src is image OR forcing conversion → convert to PDF.
+    # - If no src → generate fallback PDF (dev only).
+    try:
+        if src:
+            lower = src.lower()
+            if lower.endswith(".pdf") and PNG_TO_PDF_MODE != "force":
+                pdf_bytes = http_get(src)
+            elif lower.endswith((".png", ".jpg", ".jpeg")) or PNG_TO_PDF_MODE in ("auto", "force"):
+                img_bytes = http_get(src)
+                pdf_bytes = image_to_pdf_bytes(img_bytes)
+            else:
+                # Unknown extension, try as PDF first
+                try:
+                    pdf_bytes = http_get(src)
+                except Exception:
+                    # last resort: try reading as image then convert
+                    img_bytes = http_get(src)
+                    pdf_bytes = image_to_pdf_bytes(img_bytes)
+        else:
+            # No DB label_url; fallback generated PDF
+            pdf_bytes = make_fallback_pdf(barcode)
+    except requests.HTTPError as e:
+        log.warning(f"Upstream fetch failed ({src}): {e}")
+        # give a clear machine-friendly 404:
+        raise HTTPException(status_code=404, detail="PDF source not reachable")
     except Exception as e:
-        log.warning(f"DB pool close failed: {e}")
+        log.exception("Error producing PDF")
+        raise HTTPException(status_code=500, detail="PDF conversion error")
+
+    return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf")
