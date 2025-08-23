@@ -102,11 +102,11 @@ vars AS (
   GROUP BY oi."OrderId"
 )
 SELECT
-  o."OrderNumber" AS barcode,
-  COALESCE(os1.label_url, '') AS label_url,
-  COALESCE(q.qty, 1)          AS quantity,
+  o."OrderNumber"               AS barcode,
+  COALESCE(os1.label_url, '')   AS label_url,
+  COALESCE(q.qty, 1)            AS quantity,
   COALESCE(v.vars, '[]'::jsonb) AS vars,
-  o."OrderStatusId" AS status
+  o."OrderStatusId"             AS status
 FROM "Orders" o
 LEFT JOIN qty  q ON q."OrderId" = o."Id"
 LEFT JOIN vars v ON v."OrderId" = o."Id"
@@ -117,8 +117,9 @@ LEFT JOIN LATERAL (
   ORDER BY os."CreatedAt" DESC NULLS LAST
   LIMIT 1
 ) os1 ON TRUE
-WHERE o."OrderNumber" = $1
+WHERE o."OrderNumber" = %s      -- <<<< change here
 LIMIT 1;
+
 """
 
 # ----------------------
