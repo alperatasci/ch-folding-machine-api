@@ -1,6 +1,10 @@
-fastapi==0.112.0
-uvicorn[standard]==0.30.6
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
 psycopg2-binary==2.9.9
-python-dotenv==1.0.1
-requests==2.32.3      # NEW
-Pillow==10.4.0        # NEW (PNG→PDF)
+requests==2.31.0
+Pillow==10.1.0
+pydantic[email]==2.5.0
+pydantic-settings==2.5.2
+cachetools==5.3.2
+structlog==23.2.0
+img2pdf==0.4.4
