@@ -106,7 +106,7 @@ SELECT
   COALESCE(os1.label_url, '') AS label_url,
   COALESCE(q.qty, 1)          AS quantity,
   COALESCE(v.vars, '[]'::jsonb) AS vars,
-  o."OrderStatus" AS status
+  o."OrderStatusId" AS status
 FROM "Orders" o
 LEFT JOIN qty  q ON q."OrderId" = o."Id"
 LEFT JOIN vars v ON v."OrderId" = o."Id"
