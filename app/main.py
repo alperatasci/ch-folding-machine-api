@@ -31,24 +31,31 @@ app = FastAPI(title="CH Folding Machine API", version="1.0.0")
 POOL: Optional[SimpleConnectionPool] = None
 
 ORDER_QUERY = """
-with item_vars as (
-  select oi."OrderId",
-         json_agg(json_build_object('name', oiv."FormattedName", 'value', oiv."FormattedValue")) as vars,
-         sum(oi."Quantity") as qty
-  from "OrderItems" oi
-  left join "OrderItemVariations" oiv on oiv."OrderItemId" = oi."Id"
-  group by oi."OrderId"
+WITH qty AS (
+  SELECT oi."OrderId", SUM(oi."Quantity") AS qty
+  FROM "OrderItems" oi
+  GROUP BY oi."OrderId"
+),
+vars AS (
+  SELECT oi."OrderId",
+         jsonb_agg(DISTINCT jsonb_build_object('name', oiv."FormattedName",
+                                               'value', oiv."FormattedValue")) AS vars
+  FROM "OrderItems" oi
+  LEFT JOIN "OrderItemVariations" oiv ON oiv."OrderItemId" = oi."Id"
+  GROUP BY oi."OrderId"
 )
-select o."OrderNumber" as barcode,
-       coalesce(os."LabelUrl", os."TrackingUrl", '') as label_url,
-       coalesce(iv.qty, 1) as quantity,
-       coalesce(iv.vars, '[]'::json) as vars
-from "Orders" o
-left join "OrderShipments" os on os."OrderId" = o."Id"
-left join item_vars iv on iv."OrderId" = o."Id"
-where o."OrderNumber" = %s
-order by os."CreatedAt" desc nulls last
-limit 1;
+SELECT o."OrderNumber" AS barcode,
+       COALESCE(os."LabelUrl", os."TrackingUrl", '') AS label_url,
+       COALESCE(q.qty, 1) AS quantity,
+       COALESCE(v.vars, '[]'::jsonb) AS vars
+FROM "Orders" o
+LEFT JOIN "OrderShipments" os ON os."OrderId" = o."Id"
+LEFT JOIN qty q ON q."OrderId" = o."Id"
+LEFT JOIN vars v ON v."OrderId" = o."Id"
+WHERE o."OrderNumber" = %s
+ORDER BY os."CreatedAt" DESC NULLS LAST
+LIMIT 1;
+
 """
 
 # ----------------------
