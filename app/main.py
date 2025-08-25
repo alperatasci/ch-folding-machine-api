@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     fallback_pdf_base: str = Field("", env="FALLBACK_PDF_BASE")
     include_png_url: bool = Field(False, env="INCLUDE_PNG_URL")
     png_to_pdf_mode: str = Field("auto", env="PNG_TO_PDF_MODE")  # auto|force|off
-    http_timeout: float = Field(10.0, env="HTTP_TIMEOUT")
+    http_timeout: float = Field(30.0, env="HTTP_TIMEOUT")
     cache_ttl_meta: int = Field(600, env="CACHE_TTL_META_SEC")  # 10 min
     cache_ttl_pdf: int = Field(600, env="CACHE_TTL_PDF_SEC")   # 10 min
     cache_max_size: int = Field(1000, env="CACHE_MAX_SIZE")
@@ -84,40 +84,33 @@ class OrderData:
     vars: List[Dict[str, Any]]
     status: Optional[int]
 
-# Optimized SQL with better indexing hints
+# Optimized SQL with better indexing hints and performance improvements
 ORDER_QUERY = """
-WITH qty AS (
-  SELECT oi."OrderId", SUM(oi."Quantity") AS qty
-  FROM "OrderItems" oi
-  GROUP BY oi."OrderId"
-),
-vars AS (
-  SELECT oi."OrderId",
-         jsonb_agg(DISTINCT jsonb_build_object(
-           'name',  oiv."FormattedName",
-           'value', oiv."FormattedValue"
-         )) FILTER (WHERE oiv."FormattedName" IS NOT NULL) AS vars
-  FROM "OrderItems" oi
-  LEFT JOIN "OrderItemVariations" oiv ON oiv."OrderItemId" = oi."Id"
-  GROUP BY oi."OrderId"
-)
 SELECT
   o."OrderNumber"               AS barcode,
-  COALESCE(os1.label_url, '')   AS label_url,
-  COALESCE(q.qty, 1)            AS quantity,
-  COALESCE(v.vars, '[]'::jsonb) AS vars,
+  COALESCE(os."LabelUrl", os."TrackingUrl", '') AS label_url,
+  COALESCE((
+    SELECT SUM(oi."Quantity") 
+    FROM "OrderItems" oi 
+    WHERE oi."OrderId" = o."Id"
+  ), 1) AS quantity,
+  COALESCE((
+    SELECT jsonb_agg(DISTINCT jsonb_build_object(
+      'name',  oiv."FormattedName",
+      'value', oiv."FormattedValue"
+    )) FILTER (WHERE oiv."FormattedName" IS NOT NULL)
+    FROM "OrderItems" oi
+    LEFT JOIN "OrderItemVariations" oiv ON oiv."OrderItemId" = oi."Id"
+    WHERE oi."OrderId" = o."Id"
+  ), '[]'::jsonb) AS vars,
   o."OrderStatusId"             AS status
 FROM "Orders" o
-LEFT JOIN qty  q ON q."OrderId" = o."Id"
-LEFT JOIN vars v ON v."OrderId" = o."Id"
-LEFT JOIN LATERAL (
-  SELECT COALESCE(os."LabelUrl", os."TrackingUrl") AS label_url
-  FROM "OrderShipments" os
-  WHERE os."OrderId" = o."Id"
-  ORDER BY os."CreatedAt" DESC NULLS LAST
-  LIMIT 1
-) os1 ON TRUE
-WHERE o."OrderNumber" = %s      -- <<<< change here
+LEFT JOIN "OrderShipments" os ON os."OrderId" = o."Id" AND os."CreatedAt" = (
+  SELECT MAX(os2."CreatedAt") 
+  FROM "OrderShipments" os2 
+  WHERE os2."OrderId" = o."Id"
+)
+WHERE o."OrderNumber" = %s
 LIMIT 1;
 
 """
@@ -333,19 +326,26 @@ async def logging_middleware(request: Request, call_next):
 # Enhanced Database Operations
 # ----------------------
 def db_get_order(barcode: str) -> Optional[OrderData]:
-    """Fetch order info from DB with enhanced error handling"""
+    """Fetch order info from DB with enhanced error handling and timeout monitoring"""
+    start_time = time.time()
+    
     with db_pool.get_connection() as conn:
         if not conn:
+            logger.warning("Database connection not available", barcode=barcode)
             return None
         
         try:
             with conn.cursor() as cur:
+                logger.debug("Database query starting", barcode=barcode)
                 cur.execute(ORDER_QUERY, (barcode,))
                 row = cur.fetchone()
+                duration = time.time() - start_time
+                
                 if not row:
-                    logger.info("Order not found in database", barcode=barcode)
+                    logger.info("Order not found in database", barcode=barcode, query_duration=f"{duration:.2f}s")
                     return None
                 
+                logger.debug("Database query successful", barcode=barcode, query_duration=f"{duration:.2f}s")
                 return OrderData(
                     barcode=row[0],
                     label_url=row[1] or "",
@@ -354,10 +354,12 @@ def db_get_order(barcode: str) -> Optional[OrderData]:
                     status=int(row[4]) if row[4] is not None else None
                 )
         except psycopg2.Error as e:
-            logger.error("Database query failed", barcode=barcode, error=str(e))
+            duration = time.time() - start_time
+            logger.error("Database query failed", barcode=barcode, query_duration=f"{duration:.2f}s", error=str(e))
             raise HTTPException(status_code=503, detail="Database temporarily unavailable")
         except Exception as e:
-            logger.error("Unexpected database error", barcode=barcode, error=str(e))
+            duration = time.time() - start_time
+            logger.error("Unexpected database error", barcode=barcode, query_duration=f"{duration:.2f}s", error=str(e))
             raise HTTPException(status_code=500, detail="Internal server error")
 
 # ----------------------
@@ -391,9 +393,11 @@ def build_urls(barcode: str, label_url: str) -> Tuple[str, Optional[str]]:
 def http_get_with_retry(url: str, stream: bool = False, retries: int = 2):
     """HTTP GET with retry logic"""
     last_exception = None
+    start_time = time.time()
     
     for attempt in range(retries + 1):
         try:
+            logger.info("HTTP request starting", url=url, attempt=attempt + 1, timeout=settings.http_timeout)
             response = requests.get(
                 url, 
                 timeout=settings.http_timeout, 
@@ -401,8 +405,24 @@ def http_get_with_retry(url: str, stream: bool = False, retries: int = 2):
                 headers={'User-Agent': 'CH-Folding-Machine-API/2.0.0'}
             )
             response.raise_for_status()
+            duration = time.time() - start_time
+            logger.info("HTTP request successful", url=url, duration=f"{duration:.2f}s")
             return response
+        except requests.Timeout as e:
+            duration = time.time() - start_time
+            logger.error("HTTP request timeout", url=url, duration=f"{duration:.2f}s", timeout=settings.http_timeout)
+            last_exception = e
+            if attempt < retries:
+                wait_time = 2 ** attempt
+                logger.warning(f"HTTP timeout, retrying in {wait_time}s", 
+                             url=url, attempt=attempt + 1, error=str(e))
+                time.sleep(wait_time)
+            else:
+                logger.error("HTTP request failed after all retries due to timeout", 
+                           url=url, retries=retries, total_duration=f"{duration:.2f}s")
         except requests.RequestException as e:
+            duration = time.time() - start_time
+            logger.error("HTTP request failed", url=url, duration=f"{duration:.2f}s", error=str(e))
             last_exception = e
             if attempt < retries:
                 wait_time = 2 ** attempt  # Exponential backoff
