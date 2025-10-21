@@ -640,8 +640,7 @@ def _ship_order_in_db(barcode: str) -> bool:
                     SET
                         "OrderStatusId" = 4,
                         "ScanToShippedAt" = NOW(),
-                        "ScanToShippedUser" = 'AutoPacking',
-                        "UpdatedAt" = NOW()
+                        "ScanToShippedUser" = 'AutoPacking'
                     WHERE "OrderNumber" = %s
                     AND "OrderStatusId" < 4
                     RETURNING "Id"
