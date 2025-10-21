@@ -654,11 +654,11 @@ def _ship_order_in_db(barcode: str) -> bool:
 
                 order_id = result[0]
 
-                # Insert order history
+                # Insert order history (matching CustomHub schema: OldValue, NewValue, CreatedUser, CreatedAt)
                 cur.execute("""
                     INSERT INTO "OrderHistories"
-                    ("Id", "OrderId", "Description", "CreatedBy", "CreatedAt")
-                    VALUES (gen_random_uuid(), %s, 'Order is shipped (AutoPacking)', 'AutoPacking', NOW())
+                    ("Id", "OrderId", "OldValue", "NewValue", "CreatedUser", "CreatedAt")
+                    VALUES (gen_random_uuid(), %s, 'Progressing Shipment', 'Shipped', 'AutoPacking', NOW())
                 """, (order_id,))
 
                 conn.commit()
