@@ -657,8 +657,8 @@ def _ship_order_in_db(barcode: str) -> bool:
                 # Insert order history
                 cur.execute("""
                     INSERT INTO "OrderHistories"
-                    ("Id", "OrderId", "OrderStatusId", "Description", "CreatedBy", "CreatedAt")
-                    VALUES (gen_random_uuid(), %s, 4, 'Order is shipped (AutoPacking)', 'AutoPacking', NOW())
+                    ("Id", "OrderId", "Description", "CreatedBy", "CreatedAt")
+                    VALUES (gen_random_uuid(), %s, 'Order is shipped (AutoPacking)', 'AutoPacking', NOW())
                 """, (order_id,))
 
                 conn.commit()
