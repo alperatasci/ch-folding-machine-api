@@ -625,11 +625,57 @@ def detailed_health_check():
 def root():
     return {"ok": True, "service": "ch-folding-machine-api", "version": "2.0.0"}
 
+def _ship_order_in_db(barcode: str) -> bool:
+    """Ship order by updating database directly to OrderStatusId=4"""
+    with db_pool.get_connection() as conn:
+        if not conn:
+            logger.warning("Database connection not available for shipping", barcode=barcode)
+            return False
+
+        try:
+            with conn.cursor() as cur:
+                # Update order to shipped status
+                cur.execute("""
+                    UPDATE "Orders"
+                    SET
+                        "OrderStatusId" = 4,
+                        "ScanToShippedAt" = NOW(),
+                        "ScanToShippedUser" = 'AutoPacking',
+                        "UpdatedAt" = NOW()
+                    WHERE "OrderNumber" = %s
+                    AND "OrderStatusId" < 4
+                    RETURNING "Id"
+                """, (barcode,))
+
+                result = cur.fetchone()
+
+                if not result:
+                    # Already shipped or not found - not an error
+                    return True
+
+                order_id = result[0]
+
+                # Insert order history
+                cur.execute("""
+                    INSERT INTO "OrderHistories"
+                    ("Id", "OrderId", "OrderStatusId", "Description", "CreatedBy", "CreatedAt")
+                    VALUES (gen_random_uuid(), %s, 4, 'Order is shipped (AutoPacking)', 'AutoPacking', NOW())
+                """, (order_id,))
+
+                conn.commit()
+                logger.info("Order shipped successfully", barcode=barcode, order_id=str(order_id))
+                return True
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("Error shipping order", barcode=barcode, error=str(e))
+            return False
+
 def _create_factory_payload(barcode: str) -> FactoryResponse:
     """Create factory response payload with enhanced error handling"""
     try:
         data = resolve_label(barcode)
-        
+
         # If shipped/cancelled: tell the machine not to proceed
         if data.get("blocked"):
             return FactoryResponse(
@@ -642,7 +688,7 @@ def _create_factory_payload(barcode: str) -> FactoryResponse:
                 Barcode=barcode,
                 PDFUrl="",
             )
-        
+
         payload = FactoryResponse(
             code=1,
             msg="OK",
@@ -654,12 +700,17 @@ def _create_factory_payload(barcode: str) -> FactoryResponse:
             PDFUrl=data["pdf_url"],
             PNGUrl=data["png_url"] if settings.include_png_url else None
         )
-        
+
         # If no DB row and no FALLBACK_PDF_BASE, mark as not found
         if not data.get("label_url") and not settings.fallback_pdf_base:
             payload.code = 0
             payload.msg = "Not found"
-        
+
+        # NEW: Ship the order automatically when returning PDF URL
+        # (Only if order was found and not blocked)
+        if payload.code == 1:
+            _ship_order_in_db(barcode)
+
         return payload
     except HTTPException:
         raise
