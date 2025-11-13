@@ -730,8 +730,14 @@ def _ship_order_in_db(barcode: str, pool: DatabasePool = None) -> bool:
             logger.error("Error shipping order", barcode=barcode, db_name=pool.name, error=str(e))
             return False
 
-def _create_factory_payload(barcode: str, pool: DatabasePool = None) -> FactoryResponse:
-    """Create factory response payload with enhanced error handling"""
+def _create_factory_payload(barcode: str, pool: DatabasePool = None, return_raw_url: bool = False) -> FactoryResponse:
+    """Create factory response payload with enhanced error handling
+
+    Args:
+        barcode: Order barcode/number
+        pool: Database pool to use
+        return_raw_url: If True, return the raw LabelUrl from database instead of /label/{barcode}.pdf
+    """
     if pool is None:
         pool = db_pool
 
@@ -751,24 +757,40 @@ def _create_factory_payload(barcode: str, pool: DatabasePool = None) -> FactoryR
                 PDFUrl="",
             )
 
-        payload = FactoryResponse(
-            code=1,
-            msg="OK",
-            Quantity=data["quantity"],
-            Order=data["order"],
-            Color=data["color"],
-            Size=data["size"],
-            Barcode=barcode,
-            PDFUrl=data["pdf_url"],
-            PNGUrl=data["png_url"] if settings.include_png_url else None
-        )
+        # For PNG endpoints, return the raw URL from database
+        if return_raw_url:
+            raw_url = data.get("label_url", "")
+            payload = FactoryResponse(
+                code=1 if raw_url else 0,
+                msg="OK" if raw_url else "No label URL found in database",
+                Quantity=data["quantity"],
+                Order=data["order"],
+                Color=data["color"],
+                Size=data["size"],
+                Barcode=barcode,
+                PDFUrl=raw_url,  # Return the exact URL from database
+                PNGUrl=raw_url if raw_url else None
+            )
+        else:
+            # For PDF endpoints, return the constructed /label/{barcode}.pdf URL
+            payload = FactoryResponse(
+                code=1,
+                msg="OK",
+                Quantity=data["quantity"],
+                Order=data["order"],
+                Color=data["color"],
+                Size=data["size"],
+                Barcode=barcode,
+                PDFUrl=data["pdf_url"],
+                PNGUrl=data["png_url"] if settings.include_png_url else None
+            )
 
-        # If no DB row and no FALLBACK_PDF_BASE, mark as not found
-        if not data.get("label_url") and not settings.fallback_pdf_base:
-            payload.code = 0
-            payload.msg = "Not found"
+            # If no DB row and no FALLBACK_PDF_BASE, mark as not found
+            if not data.get("label_url") and not settings.fallback_pdf_base:
+                payload.code = 0
+                payload.msg = "Not found"
 
-        # NEW: Ship the order automatically when returning PDF URL
+        # Ship the order automatically when returning a successful response
         # (Only if order was found and not blocked)
         if payload.code == 1:
             _ship_order_in_db(barcode, pool)
@@ -826,24 +848,32 @@ def spoondash_post_pdfurl_alias(body: ScanBody):
 @app.get("/api/scanbarcode/getpngurl", response_model=FactoryResponse)
 def get_pngurl(barcode: str = Query(..., description="order number / barcode"),
                mac: Optional[str] = Query(None)):
-    """United Pod - Get PNG URL without PDF conversion"""
-    return _create_factory_payload(barcode, db_pool)
+    """United Pod - Get original image URL from database without PDF conversion
+
+    Returns the exact LabelUrl from the database in the PDFUrl field.
+    This is the raw image URL (PNG/JPG) without any conversion.
+    """
+    return _create_factory_payload(barcode, db_pool, return_raw_url=True)
 
 @app.post("/api/scanbarcode/getpngurl", response_model=FactoryResponse)
 def post_pngurl(body: ScanBody):
-    """United Pod - Get PNG URL without PDF conversion"""
-    return _create_factory_payload(body.barcode, db_pool)
+    """United Pod - Get original image URL from database without PDF conversion"""
+    return _create_factory_payload(body.barcode, db_pool, return_raw_url=True)
 
 @app.get("/api/spoondash/scanbarcode/getpngurl", response_model=FactoryResponse)
 def spoondash_get_pngurl(barcode: str = Query(..., description="order number / barcode"),
                          mac: Optional[str] = Query(None)):
-    """Spoondash - Get PNG URL without PDF conversion"""
-    return _create_factory_payload(barcode, db_pool_spoondash)
+    """Spoondash - Get original image URL from database without PDF conversion
+
+    Returns the exact LabelUrl from the database in the PDFUrl field.
+    This is the raw image URL (PNG/JPG) without any conversion.
+    """
+    return _create_factory_payload(barcode, db_pool_spoondash, return_raw_url=True)
 
 @app.post("/api/spoondash/scanbarcode/getpngurl", response_model=FactoryResponse)
 def spoondash_post_pngurl(body: ScanBody):
-    """Spoondash - Get PNG URL without PDF conversion"""
-    return _create_factory_payload(body.barcode, db_pool_spoondash)
+    """Spoondash - Get original image URL from database without PDF conversion"""
+    return _create_factory_payload(body.barcode, db_pool_spoondash, return_raw_url=True)
 
 @app.get("/label/{barcode}.png")
 async def serve_png(barcode: str, db: str = Query("unitedpod", description="Database: unitedpod or spoondash")):
