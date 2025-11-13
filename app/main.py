@@ -24,8 +24,14 @@ import structlog
 # Configuration with Validation
 # ----------------------
 class Settings(BaseSettings):
+    # United Pod database (existing)
     database_url: str = Field("", env="DATABASE_URL")
     pgssl: str = Field("require", env="PGSSL")
+
+    # Spoondash database (new)
+    database_url_spoondash: str = Field("", env="DATABASE_URL_SPOONDASH")
+    pgssl_spoondash: str = Field("require", env="PGSSL_SPOONDASH")
+
     fallback_pdf_base: str = Field("", env="FALLBACK_PDF_BASE")
     include_png_url: bool = Field(False, env="INCLUDE_PNG_URL")
     png_to_pdf_mode: str = Field("auto", env="PNG_TO_PDF_MODE")  # auto|force|off
@@ -36,11 +42,11 @@ class Settings(BaseSettings):
     pg_min_conn: int = Field(1, env="PG_MIN")
     pg_max_conn: int = Field(20, env="PG_MAX")
     log_level: str = Field("INFO", env="LOG_LEVEL")
-    
+
     # PDF generation settings
     fallback_pdf_width: int = Field(600, env="FALLBACK_PDF_WIDTH")
     fallback_pdf_height: int = Field(900, env="FALLBACK_PDF_HEIGHT")
-    
+
     # Streaming settings
     stream_chunk_size: int = Field(8192, env="STREAM_CHUNK_SIZE")
 
@@ -137,65 +143,69 @@ class FactoryResponse(BaseModel):
 # Enhanced Connection Pool Management
 # ----------------------
 class DatabasePool:
-    def __init__(self):
+    def __init__(self, name: str = "default", db_url: str = "", ssl_mode: str = "require"):
         self.pool: Optional[SimpleConnectionPool] = None
         self._initialized = False
-    
+        self.name = name
+        self.db_url = db_url
+        self.ssl_mode = ssl_mode
+
     def initialize(self):
-        if not settings.database_url:
-            logger.warning("DATABASE_URL not set. API will run in FALLBACK mode only.")
+        if not self.db_url:
+            logger.warning(f"{self.name} DATABASE_URL not set. API will run in FALLBACK mode only.", db_name=self.name)
             return
-            
+
         try:
-            dsn = settings.database_url
-            if "sslmode=" not in dsn and settings.pgssl:
+            dsn = self.db_url
+            if "sslmode=" not in dsn and self.ssl_mode:
                 sep = "&" if "?" in dsn else "?"
-                dsn = f"{dsn}{sep}sslmode={settings.pgssl}"
-            
+                dsn = f"{dsn}{sep}sslmode={self.ssl_mode}"
+
             self.pool = SimpleConnectionPool(
                 minconn=settings.pg_min_conn,
                 maxconn=settings.pg_max_conn,
                 dsn=dsn
             )
             self._initialized = True
-            logger.info("Database pool initialized", 
-                       min_conn=settings.pg_min_conn, 
+            logger.info(f"{self.name} database pool initialized",
+                       db_name=self.name,
+                       min_conn=settings.pg_min_conn,
                        max_conn=settings.pg_max_conn)
         except Exception as e:
-            logger.error("Failed to initialize database pool", error=str(e))
+            logger.error(f"Failed to initialize {self.name} database pool", db_name=self.name, error=str(e))
             raise
-    
+
     def close(self):
         if self.pool:
             self.pool.closeall()
-            logger.info("Database pool closed")
+            logger.info(f"{self.name} database pool closed", db_name=self.name)
             self._initialized = False
-    
+
     @contextmanager
     def get_connection(self):
         if not self.pool or not self._initialized:
             yield None
             return
-        
+
         conn = None
         try:
             conn = self.pool.getconn()
             yield conn
         except Exception as e:
-            logger.error("Database connection error", error=str(e))
+            logger.error(f"{self.name} database connection error", db_name=self.name, error=str(e))
             raise
         finally:
             if conn:
                 try:
                     self.pool.putconn(conn)
                 except Exception as e:
-                    logger.error("Failed to return connection to pool", error=str(e))
-    
+                    logger.error(f"Failed to return connection to {self.name} pool", db_name=self.name, error=str(e))
+
     def health_check(self) -> bool:
         """Check if database is accessible"""
         if not self.pool or not self._initialized:
             return False
-        
+
         try:
             with self.get_connection() as conn:
                 if conn:
@@ -203,11 +213,23 @@ class DatabasePool:
                         cur.execute("SELECT 1")
                         return cur.fetchone() is not None
         except Exception as e:
-            logger.error("Database health check failed", error=str(e))
+            logger.error(f"{self.name} database health check failed", db_name=self.name, error=str(e))
             return False
         return False
 
-db_pool = DatabasePool()
+# United Pod database pool (existing)
+db_pool = DatabasePool(
+    name="UnitedPod",
+    db_url=settings.database_url,
+    ssl_mode=settings.pgssl
+)
+
+# Spoondash database pool (new)
+db_pool_spoondash = DatabasePool(
+    name="Spoondash",
+    db_url=settings.database_url_spoondash,
+    ssl_mode=settings.pgssl_spoondash
+)
 
 # ----------------------
 # Enhanced Caching with Auto-Cleanup
@@ -267,10 +289,12 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting CH Folding Machine API", version="2.0.0")
     db_pool.initialize()
+    db_pool_spoondash.initialize()
     yield
     # Shutdown
     logger.info("Shutting down CH Folding Machine API")
     db_pool.close()
+    db_pool_spoondash.close()
     cache_manager.clear()
 
 app = FastAPI(
@@ -325,27 +349,30 @@ async def logging_middleware(request: Request, call_next):
 # ----------------------
 # Enhanced Database Operations
 # ----------------------
-def db_get_order(barcode: str) -> Optional[OrderData]:
+def db_get_order(barcode: str, pool: DatabasePool = None) -> Optional[OrderData]:
     """Fetch order info from DB with enhanced error handling and timeout monitoring"""
+    if pool is None:
+        pool = db_pool
+
     start_time = time.time()
-    
-    with db_pool.get_connection() as conn:
+
+    with pool.get_connection() as conn:
         if not conn:
-            logger.warning("Database connection not available", barcode=barcode)
+            logger.warning("Database connection not available", barcode=barcode, db_name=pool.name)
             return None
-        
+
         try:
             with conn.cursor() as cur:
-                logger.debug("Database query starting", barcode=barcode)
+                logger.debug("Database query starting", barcode=barcode, db_name=pool.name)
                 cur.execute(ORDER_QUERY, (barcode,))
                 row = cur.fetchone()
                 duration = time.time() - start_time
-                
+
                 if not row:
-                    logger.info("Order not found in database", barcode=barcode, query_duration=f"{duration:.2f}s")
+                    logger.info("Order not found in database", barcode=barcode, db_name=pool.name, query_duration=f"{duration:.2f}s")
                     return None
-                
-                logger.debug("Database query successful", barcode=barcode, query_duration=f"{duration:.2f}s")
+
+                logger.debug("Database query successful", barcode=barcode, db_name=pool.name, query_duration=f"{duration:.2f}s")
                 return OrderData(
                     barcode=row[0],
                     label_url=row[1] or "",
@@ -355,11 +382,11 @@ def db_get_order(barcode: str) -> Optional[OrderData]:
                 )
         except psycopg2.Error as e:
             duration = time.time() - start_time
-            logger.error("Database query failed", barcode=barcode, query_duration=f"{duration:.2f}s", error=str(e))
+            logger.error("Database query failed", barcode=barcode, db_name=pool.name, query_duration=f"{duration:.2f}s", error=str(e))
             raise HTTPException(status_code=503, detail="Database temporarily unavailable")
         except Exception as e:
             duration = time.time() - start_time
-            logger.error("Unexpected database error", barcode=barcode, query_duration=f"{duration:.2f}s", error=str(e))
+            logger.error("Unexpected database error", barcode=barcode, db_name=pool.name, query_duration=f"{duration:.2f}s", error=str(e))
             raise HTTPException(status_code=500, detail="Internal server error")
 
 # ----------------------
@@ -525,19 +552,23 @@ def stream_bytes(data: bytes, chunk_size: int | None = None) -> Iterator[bytes]:
 # ----------------------
 # Enhanced Business Logic
 # ----------------------
-def resolve_label(barcode: str) -> Dict[str, Any]:
+def resolve_label(barcode: str, pool: DatabasePool = None) -> Dict[str, Any]:
     """Resolve label information with enhanced caching and error handling"""
-    # Check cache first
-    cached_data = cache_manager.get_meta(barcode)
+    if pool is None:
+        pool = db_pool
+
+    # Check cache first - use pool name in cache key
+    cache_key = f"{pool.name}_{barcode}"
+    cached_data = cache_manager.get_meta(cache_key)
     if cached_data:
-        logger.debug("Cache hit for barcode", barcode=barcode)
+        logger.debug("Cache hit for barcode", barcode=barcode, db_name=pool.name)
         return cached_data
-    
-    logger.debug("Cache miss for barcode", barcode=barcode)
-    
+
+    logger.debug("Cache miss for barcode", barcode=barcode, db_name=pool.name)
+
     # Get from database
-    order_data = db_get_order(barcode)
-    
+    order_data = db_get_order(barcode, pool)
+
     # Check if order is blocked
     if order_data and order_data.status in BAD_STATUSES:
         data = {
@@ -553,20 +584,20 @@ def resolve_label(barcode: str) -> Dict[str, Any]:
             "png_url": None,
             "blocked": True,
         }
-        cache_manager.put_meta(barcode, data)
-        logger.info("Order blocked due to status", barcode=barcode, status=order_data.status)
+        cache_manager.put_meta(cache_key, data)
+        logger.info("Order blocked due to status", barcode=barcode, db_name=pool.name, status=order_data.status)
         return data
-    
+
     # Extract order information
     label_url = order_data.label_url if order_data else ""
     quantity = order_data.quantity if order_data else 1
     vars_list = order_data.vars if order_data else []
-    
+
     size = extract_var(vars_list, ["Size", "SIZE", "size"])
     color = extract_var(vars_list, ["Color", "COLOR", "color", "Colorway"])
-    
+
     pdf_url, png_url = build_urls(barcode, label_url)
-    
+
     data = {
         "barcode": barcode,
         "label_url": label_url,
@@ -580,9 +611,9 @@ def resolve_label(barcode: str) -> Dict[str, Any]:
         "png_url": png_url,
         "blocked": False,
     }
-    
-    cache_manager.put_meta(barcode, data)
-    logger.info("Label resolved", barcode=barcode, has_label_url=bool(label_url))
+
+    cache_manager.put_meta(cache_key, data)
+    logger.info("Label resolved", barcode=barcode, db_name=pool.name, has_label_url=bool(label_url))
     return data
 
 # ----------------------
@@ -592,9 +623,15 @@ def resolve_label(barcode: str) -> Dict[str, Any]:
 def health_check():
     """Enhanced health check with database connectivity"""
     try:
-        db_healthy = db_pool.health_check()
-        if settings.database_url and not db_healthy:
-            return PlainTextResponse("unhealthy - database connection failed", status_code=503)
+        db_unitedpod_healthy = db_pool.health_check()
+        db_spoondash_healthy = db_pool_spoondash.health_check()
+
+        # Check if any configured database is unhealthy
+        if settings.database_url and not db_unitedpod_healthy:
+            return PlainTextResponse("unhealthy - UnitedPod database connection failed", status_code=503)
+        if settings.database_url_spoondash and not db_spoondash_healthy:
+            return PlainTextResponse("unhealthy - Spoondash database connection failed", status_code=503)
+
         return PlainTextResponse("healthy")
     except Exception as e:
         logger.error("Health check failed", error=str(e))
@@ -604,15 +641,29 @@ def health_check():
 def detailed_health_check():
     """Detailed health check with system information"""
     try:
-        db_healthy = db_pool.health_check()
+        db_unitedpod_healthy = db_pool.health_check()
+        db_spoondash_healthy = db_pool_spoondash.health_check()
         cache_stats = cache_manager.stats()
-        
+
+        # Overall status is healthy if all configured databases are healthy
+        overall_healthy = True
+        if settings.database_url and not db_unitedpod_healthy:
+            overall_healthy = False
+        if settings.database_url_spoondash and not db_spoondash_healthy:
+            overall_healthy = False
+
         return {
-            "status": "healthy" if (not settings.database_url or db_healthy) else "unhealthy",
+            "status": "healthy" if overall_healthy else "unhealthy",
             "timestamp": time.time(),
-            "database": {
-                "configured": bool(settings.database_url),
-                "healthy": db_healthy
+            "databases": {
+                "unitedpod": {
+                    "configured": bool(settings.database_url),
+                    "healthy": db_unitedpod_healthy
+                },
+                "spoondash": {
+                    "configured": bool(settings.database_url_spoondash),
+                    "healthy": db_spoondash_healthy
+                }
             },
             "cache": cache_stats,
             "version": "2.0.0"
@@ -625,11 +676,14 @@ def detailed_health_check():
 def root():
     return {"ok": True, "service": "ch-folding-machine-api", "version": "2.0.0"}
 
-def _ship_order_in_db(barcode: str) -> bool:
+def _ship_order_in_db(barcode: str, pool: DatabasePool = None) -> bool:
     """Ship order by updating database directly to OrderStatusId=4"""
-    with db_pool.get_connection() as conn:
+    if pool is None:
+        pool = db_pool
+
+    with pool.get_connection() as conn:
         if not conn:
-            logger.warning("Database connection not available for shipping", barcode=barcode)
+            logger.warning("Database connection not available for shipping", barcode=barcode, db_name=pool.name)
             return False
 
         try:
@@ -662,18 +716,21 @@ def _ship_order_in_db(barcode: str) -> bool:
                 """, (order_id,))
 
                 conn.commit()
-                logger.info("Order shipped successfully", barcode=barcode, order_id=str(order_id))
+                logger.info("Order shipped successfully", barcode=barcode, db_name=pool.name, order_id=str(order_id))
                 return True
 
         except Exception as e:
             conn.rollback()
-            logger.error("Error shipping order", barcode=barcode, error=str(e))
+            logger.error("Error shipping order", barcode=barcode, db_name=pool.name, error=str(e))
             return False
 
-def _create_factory_payload(barcode: str) -> FactoryResponse:
+def _create_factory_payload(barcode: str, pool: DatabasePool = None) -> FactoryResponse:
     """Create factory response payload with enhanced error handling"""
+    if pool is None:
+        pool = db_pool
+
     try:
-        data = resolve_label(barcode)
+        data = resolve_label(barcode, pool)
 
         # If shipped/cancelled: tell the machine not to proceed
         if data.get("blocked"):
@@ -708,32 +765,155 @@ def _create_factory_payload(barcode: str) -> FactoryResponse:
         # NEW: Ship the order automatically when returning PDF URL
         # (Only if order was found and not blocked)
         if payload.code == 1:
-            _ship_order_in_db(barcode)
+            _ship_order_in_db(barcode, pool)
 
         return payload
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Error creating factory payload", barcode=barcode, error=str(e))
+        logger.error("Error creating factory payload", barcode=barcode, db_name=pool.name, error=str(e))
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# API Endpoints
+# ----------------------
+# United Pod API Endpoints (existing)
+# ----------------------
 @app.get("/api/scanbarcode/getpdfurl", response_model=FactoryResponse)
 def get_pdfurl(barcode: str = Query(..., description="order number / barcode"),
                mac: Optional[str] = Query(None)):
-    return _create_factory_payload(barcode)
+    return _create_factory_payload(barcode, db_pool)
 
 @app.get("/api/printdata", response_model=FactoryResponse)
 def get_pdfurl_alias(barcode: str = Query(...), mac: Optional[str] = Query(None)):
-    return _create_factory_payload(barcode)
+    return _create_factory_payload(barcode, db_pool)
 
 @app.post("/api/scanbarcode/getpdfurl", response_model=FactoryResponse)
 def post_pdfurl(body: ScanBody):
-    return _create_factory_payload(body.barcode)
+    return _create_factory_payload(body.barcode, db_pool)
 
 @app.post("/api/printdata", response_model=FactoryResponse)
 def post_pdfurl_alias(body: ScanBody):
-    return _create_factory_payload(body.barcode)
+    return _create_factory_payload(body.barcode, db_pool)
+
+# ----------------------
+# Spoondash API Endpoints (new)
+# ----------------------
+@app.get("/api/spoondash/scanbarcode/getpdfurl", response_model=FactoryResponse)
+def spoondash_get_pdfurl(barcode: str = Query(..., description="order number / barcode"),
+                         mac: Optional[str] = Query(None)):
+    return _create_factory_payload(barcode, db_pool_spoondash)
+
+@app.get("/api/spoondash/printdata", response_model=FactoryResponse)
+def spoondash_get_pdfurl_alias(barcode: str = Query(...), mac: Optional[str] = Query(None)):
+    return _create_factory_payload(barcode, db_pool_spoondash)
+
+@app.post("/api/spoondash/scanbarcode/getpdfurl", response_model=FactoryResponse)
+def spoondash_post_pdfurl(body: ScanBody):
+    return _create_factory_payload(body.barcode, db_pool_spoondash)
+
+@app.post("/api/spoondash/printdata", response_model=FactoryResponse)
+def spoondash_post_pdfurl_alias(body: ScanBody):
+    return _create_factory_payload(body.barcode, db_pool_spoondash)
+
+# ----------------------
+# PNG Endpoints (no PDF conversion)
+# ----------------------
+@app.get("/api/scanbarcode/getpngurl", response_model=FactoryResponse)
+def get_pngurl(barcode: str = Query(..., description="order number / barcode"),
+               mac: Optional[str] = Query(None)):
+    """United Pod - Get PNG URL without PDF conversion"""
+    return _create_factory_payload(barcode, db_pool)
+
+@app.post("/api/scanbarcode/getpngurl", response_model=FactoryResponse)
+def post_pngurl(body: ScanBody):
+    """United Pod - Get PNG URL without PDF conversion"""
+    return _create_factory_payload(body.barcode, db_pool)
+
+@app.get("/api/spoondash/scanbarcode/getpngurl", response_model=FactoryResponse)
+def spoondash_get_pngurl(barcode: str = Query(..., description="order number / barcode"),
+                         mac: Optional[str] = Query(None)):
+    """Spoondash - Get PNG URL without PDF conversion"""
+    return _create_factory_payload(barcode, db_pool_spoondash)
+
+@app.post("/api/spoondash/scanbarcode/getpngurl", response_model=FactoryResponse)
+def spoondash_post_pngurl(body: ScanBody):
+    """Spoondash - Get PNG URL without PDF conversion"""
+    return _create_factory_payload(body.barcode, db_pool_spoondash)
+
+@app.get("/label/{barcode}.png")
+async def serve_png(barcode: str, db: str = Query("unitedpod", description="Database: unitedpod or spoondash")):
+    """Serve PNG directly without PDF conversion"""
+    try:
+        # Select the appropriate database pool
+        pool = db_pool_spoondash if db.lower() == "spoondash" else db_pool
+
+        data = resolve_label(barcode, pool)
+        if data.get("blocked"):
+            raise HTTPException(status_code=409, detail="Order not eligible")
+
+        src = data.get("label_url", "")
+        if not src:
+            raise HTTPException(status_code=404, detail="No label URL found")
+
+        cache_key = (f"png_{pool.name}", barcode, src)
+
+        # Check cache
+        cached_png = cache_manager.get_pdf(cache_key)  # Reusing pdf_cache for images
+        if cached_png:
+            logger.debug("PNG cache hit", barcode=barcode, db_name=pool.name)
+            return StreamingResponse(
+                stream_bytes(cached_png),
+                media_type="image/png",
+                headers={
+                    "Cache-Control": f"public, max-age={settings.cache_ttl_pdf}",
+                    "Content-Length": str(len(cached_png))
+                }
+            )
+
+        logger.debug("PNG cache miss", barcode=barcode, db_name=pool.name)
+
+        # Fetch the image
+        try:
+            response = http_get_with_retry(src, stream=False)
+            image_bytes = response.content
+
+            # Determine media type from URL or content
+            src_lower = src.lower()
+            if src_lower.endswith(".png"):
+                media_type = "image/png"
+            elif src_lower.endswith((".jpg", ".jpeg")):
+                media_type = "image/jpeg"
+            else:
+                # Try to detect from content
+                if image_bytes.startswith(b'\x89PNG'):
+                    media_type = "image/png"
+                elif image_bytes.startswith(b'\xff\xd8\xff'):
+                    media_type = "image/jpeg"
+                else:
+                    media_type = "image/png"  # Default
+
+            # Cache the image
+            cache_manager.put_pdf(cache_key, image_bytes)
+
+            logger.info("PNG served successfully", barcode=barcode, db_name=pool.name, size=len(image_bytes))
+
+            return StreamingResponse(
+                stream_bytes(image_bytes),
+                media_type=media_type,
+                headers={
+                    "Cache-Control": f"public, max-age={settings.cache_ttl_pdf}",
+                    "Content-Length": str(len(image_bytes))
+                }
+            )
+
+        except requests.RequestException as e:
+            logger.error("Failed to fetch PNG source", barcode=barcode, db_name=pool.name, source=src, error=str(e))
+            raise HTTPException(status_code=502, detail="PNG source not reachable")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error serving PNG", barcode=barcode, error=str(e))
+        raise HTTPException(status_code=500, detail="PNG serving error")
 
 @app.get("/label/{barcode}.pdf")
 async def serve_pdf(barcode: str):
