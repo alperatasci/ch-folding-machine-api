@@ -155,6 +155,11 @@ class DatabasePool:
             logger.warning(f"{self.name} DATABASE_URL not set. API will run in FALLBACK mode only.", db_name=self.name)
             return
 
+        # Check for placeholder values
+        if "USER:PASS@HOST" in self.db_url or self.db_url.strip() == "":
+            logger.warning(f"{self.name} DATABASE_URL contains placeholder values. Skipping initialization.", db_name=self.name)
+            return
+
         try:
             dsn = self.db_url
             if "sslmode=" not in dsn and self.ssl_mode:
@@ -173,7 +178,8 @@ class DatabasePool:
                        max_conn=settings.pg_max_conn)
         except Exception as e:
             logger.error(f"Failed to initialize {self.name} database pool", db_name=self.name, error=str(e))
-            raise
+            logger.warning(f"{self.name} database pool initialization failed. API will continue without this database.", db_name=self.name)
+            # Don't raise - allow app to start without this database
 
     def close(self):
         if self.pool:
