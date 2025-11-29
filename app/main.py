@@ -793,7 +793,11 @@ def _create_factory_payload(barcode: str, pool: DatabasePool = None, return_raw_
         # Ship the order automatically when returning a successful response
         # (Only if order was found and not blocked)
         if payload.code == 1:
-            _ship_order_in_db(barcode, pool)
+            shipped = _ship_order_in_db(barcode, pool)
+            # Clear cache after shipping so next scan sees updated status
+            cache_key = f"{pool.name}_{barcode}"
+            if cache_key in cache_manager.meta_cache:
+                del cache_manager.meta_cache[cache_key]
 
         return payload
     except HTTPException:
