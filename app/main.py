@@ -121,6 +121,39 @@ LIMIT 1;
 
 """
 
+# Query to find order by tracking number
+# Matches tracking numbers where the input contains the stored tracking number
+# ShipmentStatus = 2 means Purchased (ready to ship)
+TRACKING_NUMBER_QUERY = """
+SELECT
+  o."OrderNumber"               AS barcode,
+  COALESCE(os."LabelUrl", os."TrackingUrl", '') AS label_url,
+  COALESCE((
+    SELECT SUM(oi."Quantity")
+    FROM "OrderItems" oi
+    WHERE oi."OrderId" = o."Id"
+  ), 1) AS quantity,
+  COALESCE((
+    SELECT jsonb_agg(DISTINCT jsonb_build_object(
+      'name',  oiv."FormattedName",
+      'value', oiv."FormattedValue"
+    )) FILTER (WHERE oiv."FormattedName" IS NOT NULL)
+    FROM "OrderItems" oi
+    LEFT JOIN "OrderItemVariations" oiv ON oiv."OrderItemId" = oi."Id"
+    WHERE oi."OrderId" = o."Id"
+  ), '[]'::jsonb) AS vars,
+  o."OrderStatusId"             AS status,
+  os."TrackingNumber"           AS tracking_number
+FROM "OrderShipments" os
+INNER JOIN "Orders" o ON o."Id" = os."OrderId"
+WHERE os."TrackingNumber" IS NOT NULL
+  AND os."TrackingNumber" != ''
+  AND %s LIKE '%%' || os."TrackingNumber" || '%%'
+  AND os."ShipmentStatus" = 2
+LIMIT 1;
+
+"""
+
 # ----------------------
 # Request/Response Models
 # ----------------------
@@ -393,6 +426,43 @@ def db_get_order(barcode: str, pool: DatabasePool = None) -> Optional[OrderData]
         except Exception as e:
             duration = time.time() - start_time
             logger.error("Unexpected database error", barcode=barcode, db_name=pool.name, query_duration=f"{duration:.2f}s", error=str(e))
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+def db_find_order_by_tracking(tracking_number: str, pool: DatabasePool = None) -> Optional[str]:
+    """Find order number by tracking number. Returns order number if found, None otherwise."""
+    if pool is None:
+        pool = db_pool
+
+    start_time = time.time()
+
+    with pool.get_connection() as conn:
+        if not conn:
+            logger.warning("Database connection not available for tracking lookup", tracking_number=tracking_number, db_name=pool.name)
+            return None
+
+        try:
+            with conn.cursor() as cur:
+                logger.debug("Tracking number query starting", tracking_number=tracking_number, db_name=pool.name)
+                cur.execute(TRACKING_NUMBER_QUERY, (tracking_number,))
+                row = cur.fetchone()
+                duration = time.time() - start_time
+
+                if not row:
+                    logger.info("Order not found by tracking number", tracking_number=tracking_number, db_name=pool.name, query_duration=f"{duration:.2f}s")
+                    return None
+
+                order_number = row[0]
+                found_tracking = row[5] if len(row) > 5 else None
+                logger.info("Order found by tracking number", tracking_number=tracking_number, order_number=order_number, found_tracking=found_tracking, db_name=pool.name, query_duration=f"{duration:.2f}s")
+                return order_number
+
+        except psycopg2.Error as e:
+            duration = time.time() - start_time
+            logger.error("Tracking number query failed", tracking_number=tracking_number, db_name=pool.name, query_duration=f"{duration:.2f}s", error=str(e))
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error("Unexpected database error in tracking lookup", tracking_number=tracking_number, db_name=pool.name, query_duration=f"{duration:.2f}s", error=str(e))
             raise HTTPException(status_code=500, detail="Internal server error")
 
 # ----------------------
@@ -878,6 +948,53 @@ def spoondash_get_pngurl(barcode: str = Query(..., description="order number / b
 def spoondash_post_pngurl(body: ScanBody):
     """Spoondash - Get original image URL from database without PDF conversion"""
     return _create_factory_payload(body.barcode, db_pool_spoondash, return_raw_url=True)
+
+# ----------------------
+# Tracking Number Scan Endpoints (scan tracking barcode to ship)
+# ----------------------
+@app.get("/api/scantracking/ship", response_model=FactoryResponse)
+def scan_tracking_ship(tracking: str = Query(..., description="tracking number from label barcode"),
+                       mac: Optional[str] = Query(None)):
+    """United Pod - Scan tracking number barcode to find and ship order
+
+    Searches for order by tracking number and ships it.
+    Returns order details if found, error if not found or already shipped.
+    """
+    order_number = db_find_order_by_tracking(tracking, db_pool)
+    if not order_number:
+        return FactoryResponse(
+            code=0,
+            msg="Order not found for tracking number",
+            Quantity=0,
+            Order="",
+            Color="",
+            Size="",
+            Barcode=tracking,
+            PDFUrl="",
+        )
+    return _create_factory_payload(order_number, db_pool, return_raw_url=True)
+
+@app.get("/api/spoondash/scantracking/ship", response_model=FactoryResponse)
+def spoondash_scan_tracking_ship(tracking: str = Query(..., description="tracking number from label barcode"),
+                                  mac: Optional[str] = Query(None)):
+    """Spoondash - Scan tracking number barcode to find and ship order
+
+    Searches for order by tracking number and ships it.
+    Returns order details if found, error if not found or already shipped.
+    """
+    order_number = db_find_order_by_tracking(tracking, db_pool_spoondash)
+    if not order_number:
+        return FactoryResponse(
+            code=0,
+            msg="Order not found for tracking number",
+            Quantity=0,
+            Order="",
+            Color="",
+            Size="",
+            Barcode=tracking,
+            PDFUrl="",
+        )
+    return _create_factory_payload(order_number, db_pool_spoondash, return_raw_url=True)
 
 @app.get("/label/{barcode}.png")
 async def serve_png(barcode: str, db: str = Query("unitedpod", description="Database: unitedpod or spoondash")):
