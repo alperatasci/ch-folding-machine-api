@@ -647,21 +647,27 @@ def resolve_label(barcode: str, pool: DatabasePool = None) -> Dict[str, Any]:
 
     # Check if order is blocked
     if order_data and order_data.status in BAD_STATUSES:
+        # Preserve label URL for reprinting even for blocked orders
+        label_url = order_data.label_url if order_data else ""
+        vars_list = order_data.vars if order_data else []
+        size = extract_var(vars_list, ["Size", "SIZE", "size"])
+        color = extract_var(vars_list, ["Color", "COLOR", "color", "Colorway"])
+
         data = {
             "barcode": barcode,
-            "label_url": "",
-            "quantity": 0,
-            "vars": [],
+            "label_url": label_url,  # Keep the actual label URL for reprinting
+            "quantity": order_data.quantity if order_data else 0,
+            "vars": vars_list,
             "status": order_data.status,
             "order": "",
-            "color": "",
-            "size": "",
+            "color": color,
+            "size": size,
             "pdf_url": "",
-            "png_url": None,
+            "png_url": label_url if label_url else None,  # Include PNG URL for reprinting
             "blocked": True,
         }
         cache_manager.put_meta(cache_key, data)
-        logger.info("Order blocked due to status", barcode=barcode, db_name=pool.name, status=order_data.status)
+        logger.info("Order blocked due to status", barcode=barcode, db_name=pool.name, status=order_data.status, has_label_url=bool(label_url))
         return data
 
     # Extract order information
@@ -816,9 +822,8 @@ def _create_factory_payload(barcode: str, pool: DatabasePool = None, return_raw_
 
         # If shipped/cancelled: return blocked status but still include label URL for reprinting
         if data.get("blocked"):
-            # Get the label URL from database for already-shipped orders
-            order_data = db_get_order(barcode, pool)
-            label_url = order_data.label_url if order_data else ""
+            # Use label_url from resolve_label (already preserved for blocked orders)
+            label_url = data.get("label_url", "")
 
             return FactoryResponse(
                 code=0,
