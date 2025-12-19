@@ -91,13 +91,26 @@ class OrderData:
     status: Optional[int]
 
 # Optimized SQL with better indexing hints and performance improvements
+# Now also checks LabelThumbs field and prefers shipments with actual label URLs
 ORDER_QUERY = """
 SELECT
   o."OrderNumber"               AS barcode,
-  COALESCE(os."LabelUrl", os."TrackingUrl", '') AS label_url,
+  COALESCE(
+    -- First try to get from shipment with an actual label URL
+    (SELECT COALESCE(os_with_label."LabelUrl", os_with_label."LabelThumbs", os_with_label."TrackingUrl")
+     FROM "OrderShipments" os_with_label
+     WHERE os_with_label."OrderId" = o."Id"
+       AND (os_with_label."LabelUrl" IS NOT NULL AND os_with_label."LabelUrl" != ''
+            OR os_with_label."LabelThumbs" IS NOT NULL AND os_with_label."LabelThumbs" != '')
+     ORDER BY os_with_label."CreatedAt" DESC
+     LIMIT 1),
+    -- Fallback to most recent shipment's tracking URL
+    os."TrackingUrl",
+    ''
+  ) AS label_url,
   COALESCE((
-    SELECT SUM(oi."Quantity") 
-    FROM "OrderItems" oi 
+    SELECT SUM(oi."Quantity")
+    FROM "OrderItems" oi
     WHERE oi."OrderId" = o."Id"
   ), 1) AS quantity,
   COALESCE((
@@ -112,8 +125,8 @@ SELECT
   o."OrderStatusId"             AS status
 FROM "Orders" o
 LEFT JOIN "OrderShipments" os ON os."OrderId" = o."Id" AND os."CreatedAt" = (
-  SELECT MAX(os2."CreatedAt") 
-  FROM "OrderShipments" os2 
+  SELECT MAX(os2."CreatedAt")
+  FROM "OrderShipments" os2
   WHERE os2."OrderId" = o."Id"
 )
 WHERE o."OrderNumber" = %s
