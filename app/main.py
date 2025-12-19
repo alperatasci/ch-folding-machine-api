@@ -814,17 +814,22 @@ def _create_factory_payload(barcode: str, pool: DatabasePool = None, return_raw_
     try:
         data = resolve_label(barcode, pool)
 
-        # If shipped/cancelled: tell the machine not to proceed
+        # If shipped/cancelled: return blocked status but still include label URL for reprinting
         if data.get("blocked"):
+            # Get the label URL from database for already-shipped orders
+            order_data = db_get_order(barcode, pool)
+            label_url = order_data.label_url if order_data else ""
+
             return FactoryResponse(
                 code=0,
                 msg="Order is not eligible (shipped/cancelled)",
-                Quantity=0,
+                Quantity=data.get("quantity", 0),
                 Order="",
-                Color="",
-                Size="",
+                Color=data.get("color", ""),
+                Size=data.get("size", ""),
                 Barcode=barcode,
-                PDFUrl="",
+                PDFUrl=label_url,  # Include label URL for reprinting
+                PNGUrl=label_url if label_url else None,  # Include PNG URL too
             )
 
         # For PNG endpoints, return the raw URL from database
